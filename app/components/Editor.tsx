@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Play, Pause, Clapperboard, MessageSquare, Check, Plus, Trash2, Download, AlertCircle, Film, Type, ChevronLeft, Settings2, MonitorPlay } from 'lucide-react';
+import { Play, Pause, Clapperboard, MessageSquare, Check, Plus, Trash2, Download, AlertCircle, Film, Type, ChevronLeft, Settings2, MonitorPlay, Volume2, VolumeX, Scissors } from 'lucide-react';
 import { Track, Subtitle } from '../lib/mockData';
 
 interface EditorProps {
@@ -19,16 +19,40 @@ interface StyleConfig {
     fontFamily: string;
 }
 
+interface VideoClip {
+    id: string;
+    url: string;
+    name: string;
+    startTime: number; // Trim start (offset in the video file)
+    endTime: number;   // Trim end (offset in the video file)
+    originalDuration: number;
+}
+
 export default function Editor({ track, onBack }: EditorProps) {
     // State
-    const [videoUrl, setVideoUrl] = useState<string>('');
-    const [videoDuration, setVideoDuration] = useState(0);
+    const [clips, setClips] = useState<VideoClip[]>([]);
+    const [activeClipId, setActiveClipId] = useState<string | null>(null);
+    
+    // Derived state for total visual duration
+    const totalVisualDuration = clips.reduce((acc, clip) => acc + (clip.endTime - clip.startTime), 0);
+
     const [audioDuration, setAudioDuration] = useState(0);
     const [error, setError] = useState<string | null>(null);
 
     const [subtitles, setSubtitles] = useState<Subtitle[]>(track.subtitles);
+    const [selectedSubtitleId, setSelectedSubtitleId] = useState<string | null>(null);
     const [activeTab, setActiveTab] = useState<'scene' | 'style' | 'subtitles'>('scene');
     const [isExporting, setIsExporting] = useState(false);
+    
+    // Sync toggle state (must be declared before useEffect that uses it)
+    const [isSyncEnabled, setIsSyncEnabled] = useState(true);
+    const [editingTimeField, setEditingTimeField] = useState<{index: number, field: 'time' | 'endTime', originalValue: number} | null>(null);
+
+    // Volume State
+    const [bgmVolume, setBgmVolume] = useState(0.5);
+    const [videoVolume, setVideoVolume] = useState(1);
+    const [isBgmMuted, setIsBgmMuted] = useState(false);
+    const [isVideoMuted, setIsVideoMuted] = useState(false);
 
     // Style State
     const [styleConfig, setStyleConfig] = useState<StyleConfig>({
@@ -50,6 +74,37 @@ export default function Editor({ track, onBack }: EditorProps) {
     const [currentTime, setCurrentTime] = useState(0);
     const [currentSubtitle, setCurrentSubtitle] = useState<Subtitle | null>(null);
 
+    // Track previous audio time to detect stalling
+    const lastAudioTimeRef = useRef<number>(0);
+
+    // Refs for render loop to avoid stale closures
+    const clipsRef = useRef(clips);
+    const subtitlesRef = useRef(subtitles);
+    const isPlayingRef = useRef(isPlaying);
+    const isExportingRef = useRef(isExporting);
+    
+    useEffect(() => { clipsRef.current = clips; }, [clips]);
+    useEffect(() => { subtitlesRef.current = subtitles; }, [subtitles]);
+    useEffect(() => { isPlayingRef.current = isPlaying; }, [isPlaying]);
+    useEffect(() => { isExportingRef.current = isExporting; }, [isExporting]);
+
+    // Helper to find active clip and local time
+    const getActiveClipInfo = (globalTime: number) => {
+        let accumulatedTime = 0;
+        for (const clip of clipsRef.current) {
+            const duration = clip.endTime - clip.startTime;
+            if (globalTime >= accumulatedTime && globalTime < accumulatedTime + duration) {
+                return { 
+                    clip, 
+                    localTime: clip.startTime + (globalTime - accumulatedTime),
+                    offsetInTimeline: accumulatedTime
+                };
+            }
+            accumulatedTime += duration;
+        }
+        return null;
+    };
+
     // Initialize
     useEffect(() => {
         return () => {
@@ -58,28 +113,86 @@ export default function Editor({ track, onBack }: EditorProps) {
     }, []);
 
     // Render Loop
-    const renderFrame = () => {
+    const renderFrame = (timestamp: number) => {
         if (audioRef.current && videoRef.current && canvasRef.current) {
             const rawTime = audioRef.current.currentTime;
-            // Use rawTime directly for accurate sync
+            
+            // Detect Audio Stalling
+            // If isPlaying is true, but rawTime hasn't moved since last frame, audio might be buffering/stalled.
+            // However, requestAnimationFrame runs much faster than timeupdate, so rawTime might be same for a few frames.
+            // We use a small threshold or check paused state.
+            
+            // If audio is ended, pause everything
+            if (audioRef.current.ended) {
+                setIsPlaying(false);
+                return;
+            }
+
             const time = rawTime;
             setCurrentTime(time);
 
-            // Sync video if drifted (use rawTime for video sync)
-            // Only sync if video is ready and playing
-            if (videoRef.current.readyState >= 2 && !videoRef.current.paused) {
-                if (Math.abs(videoRef.current.currentTime - rawTime) > 0.2) {
-                    videoRef.current.currentTime = rawTime;
+            // Manage Clips Playback
+            const clipInfo = getActiveClipInfo(time);
+            
+            if (clipInfo) {
+                const { clip, localTime } = clipInfo;
+                
+                // Switch source if needed
+                if (videoRef.current.src !== clip.url) {
+                    console.log("Switching clip:", clip.name);
+                    videoRef.current.src = clip.url;
+                    videoRef.current.load(); 
+                    setActiveClipId(clip.id);
+                    videoRef.current.currentTime = localTime;
+                    
+                    if (isPlayingRef.current || isExportingRef.current) {
+                        const playPromise = videoRef.current.play();
+                        if (playPromise !== undefined) {
+                            playPromise.catch(e => {
+                                console.warn("Auto-play prevented or interrupted", e);
+                            });
+                        }
+                    }
                 }
+
+                // Sync video logic (Improved)
+                if (videoRef.current.readyState >= 1 && !videoRef.current.seeking) {
+                    const diff = Math.abs(videoRef.current.currentTime - localTime);
+                    
+                    // Only force sync if:
+                    // 1. Drift is significant (> 0.2s)
+                    // 2. Audio is actually progressing (rawTime > lastAudioTimeRef.current) OR we just started
+                    // This prevents the "Infinite Loop" where audio is stuck at 0, video plays to 0.2, gets reset to 0.
+                    const audioIsProgressing = rawTime > lastAudioTimeRef.current || (rawTime === 0 && isPlayingRef.current);
+                    
+                    if (diff > 0.2 && audioIsProgressing) {
+                         // console.log("Syncing video", diff, videoRef.current.currentTime, localTime);
+                         videoRef.current.currentTime = localTime;
+                    }
+                }
+                
+                // Ensure play state matches
+                // Pause video if audio is stalled (not progressing significantly over frames)
+                // But simple check: if audioRef.paused is true, video should pause.
+                if (audioRef.current.paused && !videoRef.current.paused) {
+                    videoRef.current.pause();
+                } else if (!audioRef.current.paused && videoRef.current.paused && videoRef.current.readyState >= 3) {
+                    videoRef.current.play().catch(() => {});
+                }
+            } else if (clipsRef.current.length > 0) {
+                // End of clips
             }
 
+            // Update refs for next frame
+            lastAudioTimeRef.current = rawTime;
+
             // Find Subtitle based on adjusted time
-            const activeSub = subtitles.find((sub, index) => {
+            const activeSub = subtitlesRef.current.find((sub, index) => {
                 if (sub.endTime) {
                     return time >= sub.time && time < sub.endTime;
                 }
                 // Fallback for legacy data
-                const nextSub = subtitles[index + 1];
+                const nextSub = subtitlesRef.current[index + 1];
                 const endTime = nextSub ? nextSub.time : sub.time + 5; // Default 5s duration
                 return time >= sub.time && time < endTime;
             });
@@ -88,7 +201,7 @@ export default function Editor({ track, onBack }: EditorProps) {
             // Draw Canvas
             drawCanvas(activeSub || null);
 
-            if (isPlaying || isExporting) {
+            if (isPlayingRef.current || isExportingRef.current) {
                 requestRef.current = requestAnimationFrame(renderFrame);
             }
         }
@@ -152,6 +265,126 @@ export default function Editor({ track, onBack }: EditorProps) {
         }
     };
 
+    // Keyboard Shortcuts
+    useEffect(() => {
+        const handleKeyDown = (e: KeyboardEvent) => {
+            // Only trigger if not typing in an input
+            if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+            // Spacebar: Play/Pause
+            if (e.code === 'Space') {
+                e.preventDefault();
+                togglePlay();
+                return;
+            }
+
+            // Arrow Up/Down: Navigate between subtitles or seek to subtitle time
+            if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+                e.preventDefault();
+                
+                const currentIndex = subtitles.findIndex(sub => sub.id === selectedSubtitleId);
+                let newIndex: number;
+                
+                if (currentIndex === -1) {
+                    // No subtitle selected, select first
+                    newIndex = 0;
+                } else {
+                    newIndex = e.key === 'ArrowDown' 
+                        ? Math.min(currentIndex + 1, subtitles.length - 1)
+                        : Math.max(currentIndex - 1, 0);
+                }
+                
+                const targetSubtitle = subtitles[newIndex];
+                if (targetSubtitle) {
+                    setSelectedSubtitleId(targetSubtitle.id);
+                    
+                    // Shift + Arrow: Seek to subtitle start time
+                    if (e.shiftKey && audioRef.current) {
+                        audioRef.current.currentTime = targetSubtitle.time;
+                        if (!isPlaying) {
+                            renderFrame(performance.now());
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Left/Right arrows: Adjust subtitle timing (only if subtitle is selected)
+            if (!selectedSubtitleId) return;
+
+            if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+                e.preventDefault();
+                const offset = e.key === 'ArrowRight' ? 0.5 : -0.5;
+                const isShift = e.shiftKey; // Shift key for End Time, Normal for Start Time
+                
+                setSubtitles(prev => {
+                    const newSubtitles = [...prev];
+                    const selectedIndex = newSubtitles.findIndex(sub => sub.id === selectedSubtitleId);
+                    
+                    if (selectedIndex === -1) return prev;
+                    
+                    const sub = newSubtitles[selectedIndex];
+                    let newTime = sub.time;
+                    let newEndTime = sub.endTime || sub.time + 5;
+                    const originalEnd = newEndTime;
+
+                    if (isShift) {
+                        // Adjust End Time
+                        newEndTime = Math.max(newTime + 0.5, newEndTime + offset);
+                        
+                        // If sync is enabled, shift all following subtitles
+                        if (isSyncEnabled) {
+                            const delta = newEndTime - originalEnd;
+                            for (let i = selectedIndex + 1; i < newSubtitles.length; i++) {
+                                newSubtitles[i].time += delta;
+                                if (newSubtitles[i].time < 0) newSubtitles[i].time = 0;
+                                
+                                if (newSubtitles[i].endTime !== undefined) {
+                                    newSubtitles[i].endTime += delta;
+                                    if (newSubtitles[i].endTime < newSubtitles[i].time + 0.1) {
+                                        newSubtitles[i].endTime = newSubtitles[i].time + 0.1;
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // Adjust Start Time
+                        newTime = Math.max(0, newTime + offset);
+                        if (newTime >= newEndTime) {
+                            newEndTime = newTime + 0.5; 
+                        }
+                    }
+                    
+                    newSubtitles[selectedIndex] = {
+                        ...sub,
+                        time: newTime,
+                        endTime: newEndTime
+                    };
+                    
+                    return newSubtitles.sort((a, b) => a.time - b.time);
+                });
+            }
+        };
+
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+    }, [selectedSubtitleId, isSyncEnabled, isPlaying, subtitles]);
+
+    // Volume Control Effect (direct DOM control)
+    useEffect(() => {
+        if (audioRef.current) {
+            audioRef.current.volume = isBgmMuted ? 0 : bgmVolume;
+            audioRef.current.muted = isBgmMuted;
+        }
+    }, [bgmVolume, isBgmMuted]);
+
+    useEffect(() => {
+        if (videoRef.current) {
+            videoRef.current.volume = isVideoMuted ? 0 : videoVolume;
+            videoRef.current.muted = isVideoMuted;
+        }
+    }, [videoVolume, isVideoMuted]);
+
     // Redraw canvas when style configuration changes (font size, position, colors)
     useEffect(() => {
         if (canvasRef.current && videoRef.current) {
@@ -183,19 +416,56 @@ export default function Editor({ track, onBack }: EditorProps) {
         const file = e.target.files?.[0];
         if (file) {
             const url = URL.createObjectURL(file);
-            setVideoUrl(url);
-
+            
             const tempVideo = document.createElement('video');
             tempVideo.src = url;
             tempVideo.onloadedmetadata = () => {
-                setVideoDuration(tempVideo.duration);
-                if (audioRef.current && tempVideo.duration < audioRef.current.duration) {
-                    setError(`Video is too short! Music is ${Math.round(audioRef.current.duration)}s, but video is only ${Math.round(tempVideo.duration)}s.`);
+                const duration = tempVideo.duration;
+                
+                const newClip: VideoClip = {
+                    id: Date.now().toString(),
+                    url,
+                    name: file.name,
+                    startTime: 0,
+                    endTime: duration,
+                    originalDuration: duration
+                };
+
+                setClips(prev => [...prev, newClip]);
+                
+                // Check duration (sum of clips vs audio)
+                const totalDuration = clips.reduce((acc, c) => acc + (c.endTime - c.startTime), 0) + duration;
+                if (audioRef.current && totalDuration < audioRef.current.duration) {
+                    // setError(`Video is too short! Music is ${Math.round(audioRef.current.duration)}s, but video is only ${Math.round(totalDuration)}s.`);
                 } else {
                     setError(null);
                 }
             };
         }
+    };
+
+    const handleClipUpdate = (id: string, updates: Partial<VideoClip>) => {
+        setClips(prev => prev.map(clip => {
+            if (clip.id === id) {
+                // Validate updates
+                let newClip = { ...clip, ...updates };
+                
+                // Ensure start < end
+                if (newClip.startTime >= newClip.endTime) {
+                    newClip.startTime = clip.startTime; // Revert if invalid
+                }
+                // Ensure within bounds
+                newClip.startTime = Math.max(0, newClip.startTime);
+                newClip.endTime = Math.min(newClip.originalDuration, newClip.endTime);
+                
+                return newClip;
+            }
+            return clip;
+        }));
+    };
+
+    const handleClipRemove = (id: string) => {
+        setClips(prev => prev.filter(c => c.id !== id));
     };
 
     const handleExport = async () => {
@@ -211,26 +481,39 @@ export default function Editor({ track, onBack }: EditorProps) {
 
         const stream = canvasRef.current.captureStream(60); // 60 FPS
 
-        // Safe audio stream capture
-        let audioStream: MediaStream | null = null;
+        // Attach BGM audio track
+        const attachTracks = (mediaStream?: MediaStream | null) => {
+            if (!mediaStream) return;
+            mediaStream.getAudioTracks().forEach(track => {
+                stream.addTrack(track);
+            });
+        };
+
         try {
-            // @ts-ignore - captureStream is experimental
-            if (audioRef.current.captureStream) {
-                // @ts-ignore
-                audioStream = audioRef.current.captureStream();
-                // @ts-ignore
-            } else if (audioRef.current.mozCaptureStream) {
-                // @ts-ignore
-                audioStream = audioRef.current.mozCaptureStream();
+            if (audioRef.current?.captureStream) {
+                attachTracks(audioRef.current.captureStream());
+            } else if ((audioRef.current as any)?.mozCaptureStream) {
+                attachTracks((audioRef.current as any).mozCaptureStream());
+            } else {
+                console.warn("BGM captureStream not supported");
             }
         } catch (e) {
-            console.warn("Audio capture not supported", e);
+            console.warn("Unable to capture BGM audio", e);
         }
 
-        if (audioStream) {
-            stream.addTrack(audioStream.getAudioTracks()[0]);
-        } else {
-            alert("Audio export is not supported in this browser. The video will be silent.");
+        // Attach video clip audio (if not muted)
+        if (!isVideoMuted) {
+            try {
+                if (videoRef.current?.captureStream) {
+                    attachTracks(videoRef.current.captureStream());
+                } else if ((videoRef.current as any)?.mozCaptureStream) {
+                    attachTracks((videoRef.current as any).mozCaptureStream());
+                } else {
+                    console.warn("Video captureStream not supported");
+                }
+            } catch (e) {
+                console.warn("Unable to capture clip audio", e);
+            }
         }
 
         const mediaRecorder = new MediaRecorder(stream, {
@@ -259,7 +542,11 @@ export default function Editor({ track, onBack }: EditorProps) {
         // Start playback for recording
         try {
             await audioRef.current.play();
-            await videoRef.current.play();
+            // Trigger one frame render to set up video src if needed
+            renderFrame(performance.now());
+            if (videoRef.current.src) {
+                await videoRef.current.play();
+            }
             requestRef.current = requestAnimationFrame(renderFrame);
         } catch (e) {
             console.error("Playback failed", e);
@@ -273,6 +560,7 @@ export default function Editor({ track, onBack }: EditorProps) {
         };
     };
 
+
     const handleTimeChange = (index: number, field: 'time' | 'endTime', value: string) => {
         const numValue = parseFloat(value);
         if (isNaN(numValue)) return;
@@ -281,6 +569,7 @@ export default function Editor({ track, onBack }: EditorProps) {
         const sub = newSubtitles[index];
 
         if (field === 'time') {
+            // START 시간 조정: 해당 자막만 변경
             sub.time = numValue;
             // Ensure end time is valid
             if (sub.endTime && sub.endTime <= numValue) {
@@ -294,20 +583,56 @@ export default function Editor({ track, onBack }: EditorProps) {
                 }
             }
         } else {
+            // END 시간 조정: 일단 현재 자막만 변경 (다른 자막은 나중에 조정)
             sub.endTime = numValue;
+            
             // Ensure start time is valid
             if (sub.time >= numValue) {
                 sub.time = numValue - 0.5;
-            }
-            // Prevent overlap with next: push next start time
-            if (index < newSubtitles.length - 1) {
-                const next = newSubtitles[index + 1];
-                if (next.time < numValue) {
-                    next.time = numValue;
-                }
+                if (sub.time < 0) sub.time = 0;
             }
         }
+
         setSubtitles(newSubtitles);
+    };
+
+    const handleTimeCommit = (index: number, field: 'time' | 'endTime') => {
+        if (field !== 'endTime' || !editingTimeField || !isSyncEnabled) {
+            setEditingTimeField(null);
+            return;
+        }
+
+        const newSubtitles = [...subtitles];
+        const sub = newSubtitles[index];
+        const currentEnd = sub.endTime ?? (newSubtitles[index + 1]?.time ?? sub.time + 5);
+        const originalEnd = editingTimeField.originalValue;
+        const delta = currentEnd - originalEnd;
+
+        // 이후 모든 자막을 delta만큼 이동
+        if (delta !== 0) {
+            for (let i = index + 1; i < newSubtitles.length; i++) {
+                newSubtitles[i].time += delta;
+                if (newSubtitles[i].time < 0) newSubtitles[i].time = 0;
+                
+                if (newSubtitles[i].endTime !== undefined) {
+                    newSubtitles[i].endTime += delta;
+                    if (newSubtitles[i].endTime < newSubtitles[i].time + 0.1) {
+                        newSubtitles[i].endTime = newSubtitles[i].time + 0.1;
+                    }
+                }
+            }
+            setSubtitles(newSubtitles);
+        }
+
+        setEditingTimeField(null);
+    };
+
+    const handleTimeFocus = (index: number, field: 'time' | 'endTime') => {
+        if (field === 'endTime') {
+            const sub = subtitles[index];
+            const originalEnd = sub.endTime ?? (subtitles[index + 1]?.time ?? sub.time + 5);
+            setEditingTimeField({ index, field, originalValue: originalEnd });
+        }
     };
 
     return (
@@ -333,7 +658,7 @@ export default function Editor({ track, onBack }: EditorProps) {
                         className={`flex items-center gap-2 px-4 py-1.5 rounded-md font-medium text-xs transition-all ${isExporting ? 'bg-yellow-500/20 text-yellow-500 cursor-wait' : 'bg-blue-600 hover:bg-blue-500 text-white shadow-sm'
                             }`}
                         onClick={handleExport}
-                        disabled={isExporting || !!error || !videoUrl}
+                        disabled={isExporting || !!error || clips.length === 0}
                     >
                         {isExporting ? (
                             <>Recording...</>
@@ -360,16 +685,19 @@ export default function Editor({ track, onBack }: EditorProps) {
                             />
                             <video
                                 ref={videoRef}
-                                src={videoUrl}
+                                // src set dynamically
                                 className="hidden"
-                                muted
+                                // muted removed: we handle volume via AudioContext GainNode.
+                                // However, to prevent double audio (if not connected to AudioContext yet), we might need caution.
+                                // But crossOrigin needs to be set for Web Audio API to work with some sources, though blob: is usually fine.
+                                crossOrigin="anonymous"
                                 playsInline
-                                loop
+                                // loop removed as we manage clips
                             />
-                            {!videoUrl && (
+                            {clips.length === 0 && (
                                 <div className="absolute inset-0 flex flex-col items-center justify-center text-zinc-500 bg-zinc-900/50 backdrop-blur-sm">
                                     <Film size={48} className="mb-4 opacity-50" />
-                                    <p className="text-sm font-medium">No video loaded</p>
+                                    <p className="text-sm font-medium">No clips loaded</p>
                                 </div>
                             )}
                         </div>
@@ -393,12 +721,64 @@ export default function Editor({ track, onBack }: EditorProps) {
                                 {Math.floor(currentTime / 60)}:{Math.floor(currentTime % 60).toString().padStart(2, '0')}
                             </div>
 
+                            {/* BGM Volume Controls */}
+                            <div className="flex items-center gap-2 group/vol relative">
+                                <button 
+                                    onClick={() => setIsBgmMuted(!isBgmMuted)}
+                                    className={`transition ${isBgmMuted || bgmVolume === 0 ? 'text-zinc-600' : 'text-blue-400 hover:text-blue-300'}`}
+                                    title="BGM Volume"
+                                >
+                                    {isBgmMuted || bgmVolume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+                                </button>
+                                <span className="text-[10px] font-bold text-blue-500/50 absolute -top-2 left-0 w-full text-center pointer-events-none">BGM</span>
+                                <div className="w-0 overflow-hidden group-hover/vol:w-20 transition-all duration-300 flex items-center">
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="1"
+                                        step="0.1"
+                                        value={isBgmMuted ? 0 : bgmVolume}
+                                        onChange={(e) => {
+                                            setBgmVolume(parseFloat(e.target.value));
+                                            setIsBgmMuted(parseFloat(e.target.value) === 0);
+                                        }}
+                                        className="w-20 h-1 bg-zinc-600 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                    />
+                                </div>
+                            </div>
+
+                            {/* Video Volume Controls */}
+                            <div className="flex items-center gap-2 group/vol2 relative ml-2">
+                                <button 
+                                    onClick={() => setIsVideoMuted(!isVideoMuted)}
+                                    className={`transition ${isVideoMuted || videoVolume === 0 ? 'text-zinc-600' : 'text-green-400 hover:text-green-300'}`}
+                                    title="Video Sound"
+                                >
+                                    {isVideoMuted || videoVolume === 0 ? <VolumeX size={18} /> : <Film size={18} />}
+                                </button>
+                                <span className="text-[10px] font-bold text-green-500/50 absolute -top-2 left-0 w-full text-center pointer-events-none">CLIP</span>
+                                <div className="w-0 overflow-hidden group-hover/vol2:w-20 transition-all duration-300 flex items-center">
+                                    <input
+                                        type="range"
+                                        min="0"
+                                        max="1"
+                                        step="0.1"
+                                        value={isVideoMuted ? 0 : videoVolume}
+                                        onChange={(e) => {
+                                            setVideoVolume(parseFloat(e.target.value));
+                                            setIsVideoMuted(parseFloat(e.target.value) === 0);
+                                        }}
+                                        className="w-20 h-1 bg-zinc-600 rounded-lg appearance-none cursor-pointer accent-green-500"
+                                    />
+                                </div>
+                            </div>
+
                             <div className="flex-1 h-8 relative group cursor-pointer" onClick={(e) => {
                                 if (audioRef.current) {
                                     const rect = e.currentTarget.getBoundingClientRect();
                                     const pos = (e.clientX - rect.left) / rect.width;
                                     audioRef.current.currentTime = pos * audioRef.current.duration;
-                                    renderFrame();
+                                    renderFrame(performance.now());
                                 }
                             }}>
                                 {/* Track Background */}
@@ -443,28 +823,87 @@ export default function Editor({ track, onBack }: EditorProps) {
                         {activeTab === 'scene' && (
                             <div className="space-y-6">
                                 <div>
-                                    <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">Background Video</h3>
-                                    <div className="p-8 border border-dashed border-zinc-700 rounded-lg hover:border-zinc-500 hover:bg-white/5 transition-all text-center group cursor-pointer relative">
-                                        <input
-                                            type="file"
-                                            accept="video/*"
-                                            onChange={handleVideoUpload}
-                                            className="absolute inset-0 opacity-0 cursor-pointer"
-                                        />
-                                        <div className="w-10 h-10 bg-zinc-800 rounded-full flex items-center justify-center mx-auto mb-3 group-hover:scale-110 transition-transform">
-                                            <Plus className="text-zinc-400" size={20} />
-                                        </div>
-                                        <span className="text-sm font-medium text-zinc-300 block">Upload Video</span>
-                                        <span className="text-xs text-zinc-500 mt-1 block">MP4, WebM, MOV</span>
+                                    <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider mb-3">Video Clips</h3>
+                                    
+                                    {/* Clip List */}
+                                    <div className="space-y-3 mb-4">
+                                        {clips.map((clip, index) => (
+                                            <div key={clip.id} className="bg-[#1e1e1e] rounded-lg p-3 border border-zinc-700">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <div className="flex items-center gap-2 overflow-hidden">
+                                                        <div className="w-4 h-4 flex items-center justify-center bg-zinc-700 rounded text-[10px] font-mono text-zinc-400 shrink-0">
+                                                            {index + 1}
+                                                        </div>
+                                                        <span className="text-xs font-medium text-zinc-300 truncate" title={clip.name}>
+                                                            {clip.name}
+                                                        </span>
+                                                    </div>
+                                                    <button 
+                                                        onClick={() => handleClipRemove(clip.id)}
+                                                        className="text-zinc-500 hover:text-red-400 transition"
+                                                    >
+                                                        <Trash2 size={14} />
+                                                    </button>
+                                                </div>
+                                                
+                                                {/* Trim Controls */}
+                                                <div className="grid grid-cols-2 gap-2">
+                                                    <div>
+                                                        <label className="text-[9px] text-zinc-600 uppercase block mb-1">Start (Trim)</label>
+                                                        <input
+                                                            type="number"
+                                                            step="0.1"
+                                                            min="0"
+                                                            max={clip.endTime}
+                                                            value={clip.startTime}
+                                                            onChange={(e) => handleClipUpdate(clip.id, { startTime: parseFloat(e.target.value) })}
+                                                            className="w-full bg-black/20 text-[10px] font-mono text-zinc-300 px-1.5 py-1 rounded border border-transparent focus:border-blue-500/50 focus:outline-none"
+                                                        />
+                                                    </div>
+                                                    <div>
+                                                        <label className="text-[9px] text-zinc-600 uppercase block mb-1">End (Trim)</label>
+                                                        <input
+                                                            type="number"
+                                                            step="0.1"
+                                                            min={clip.startTime}
+                                                            max={clip.originalDuration}
+                                                            value={clip.endTime}
+                                                            onChange={(e) => handleClipUpdate(clip.id, { endTime: parseFloat(e.target.value) })}
+                                                            className="w-full bg-black/20 text-[10px] font-mono text-zinc-300 px-1.5 py-1 rounded border border-transparent focus:border-blue-500/50 focus:outline-none"
+                                                        />
+                                                    </div>
+                                                </div>
+                                                <div className="mt-1.5 flex justify-between text-[9px] text-zinc-500">
+                                                    <span>Duration: {Math.round((clip.endTime - clip.startTime) * 10) / 10}s</span>
+                                                    <span>Total: {Math.round(clip.originalDuration)}s</span>
+                                                </div>
+                                            </div>
+                                        ))}
                                     </div>
-                                    {videoUrl && (
+
+                                    <div className="p-4 border border-dashed border-zinc-700 rounded-lg hover:border-zinc-500 hover:bg-white/5 transition-all text-center group cursor-pointer relative z-10">
+                                        <label className="absolute inset-0 cursor-pointer z-20">
+                                            <input
+                                                type="file"
+                                                accept="video/*"
+                                                onChange={handleVideoUpload}
+                                                className="hidden"
+                                            />
+                                        </label>
+                                        <div className="w-8 h-8 bg-zinc-800 rounded-full flex items-center justify-center mx-auto mb-2 group-hover:scale-110 transition-transform relative z-10 pointer-events-none">
+                                            <Plus className="text-zinc-400" size={16} />
+                                        </div>
+                                        <span className="text-xs font-medium text-zinc-300 block relative z-10 pointer-events-none">Add Video Clip</span>
+                                    </div>
+                                    
+                                    {clips.length > 0 && (
                                         <div className="mt-3 p-3 bg-green-500/10 border border-green-500/20 rounded-lg flex items-center gap-3">
                                             <div className="w-8 h-8 bg-green-500/20 rounded flex items-center justify-center text-green-500">
                                                 <Check size={14} />
                                             </div>
                                             <div className="flex-1 min-w-0">
-                                                <div className="text-xs font-medium text-green-400 truncate">Video Loaded</div>
-                                                <div className="text-[10px] text-green-500/70">{Math.round(videoDuration)}s duration</div>
+                                                <div className="text-xs font-medium text-green-400 truncate">Sequence Ready</div>
+                                                <div className="text-[10px] text-green-500/70">{Math.round(totalVisualDuration)}s total visual duration</div>
                                             </div>
                                         </div>
                                     )}
@@ -558,8 +997,24 @@ export default function Editor({ track, onBack }: EditorProps) {
 
                         {activeTab === 'subtitles' && (
                             <div className="space-y-4">
-                                <div className="flex justify-between items-center mb-2">
-                                    <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Transcript</h3>
+                                <div className="sticky top-0 z-10 bg-[#1e1e1e] pb-2 pt-1 -mt-1 flex justify-between items-center mb-2">
+                                    <div className="flex items-center gap-3">
+                                        <h3 className="text-xs font-semibold text-zinc-400 uppercase tracking-wider">Transcript</h3>
+                                        <label className="flex items-center gap-2 cursor-pointer group">
+                                            <div className="relative">
+                                                <input
+                                                    type="checkbox"
+                                                    checked={isSyncEnabled}
+                                                    onChange={(e) => setIsSyncEnabled(e.target.checked)}
+                                                    className="sr-only peer"
+                                                />
+                                                <div className="w-9 h-5 bg-zinc-700 peer-focus:outline-none peer-focus:ring-2 peer-focus:ring-blue-500/50 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+                                            </div>
+                                            <span className="text-[10px] text-zinc-500 group-hover:text-zinc-300 transition uppercase tracking-wide">
+                                                {isSyncEnabled ? 'Sync ON' : 'Sync OFF'}
+                                            </span>
+                                        </label>
+                                    </div>
                                     <button
                                         onClick={() => setSubtitles([...subtitles, { id: Date.now().toString(), time: currentTime, endTime: currentTime + 3, ko: '새 자막', en: 'New Subtitle' }].sort((a, b) => a.time - b.time))}
                                         className="p-1.5 bg-blue-600 hover:bg-blue-500 rounded text-white transition"
@@ -569,8 +1024,17 @@ export default function Editor({ track, onBack }: EditorProps) {
                                 </div>
                                 <div className="space-y-2">
                                     {subtitles.map((sub, index) => (
-                                        <div key={sub.id} className={`group p-3 rounded-lg border border-transparent transition-all ${currentSubtitle?.id === sub.id ? 'bg-blue-500/10 border-blue-500/30' : 'bg-[#1e1e1e] hover:bg-[#2a2a2a]'
-                                            }`}>
+                                        <div 
+                                            key={sub.id} 
+                                            onClick={() => setSelectedSubtitleId(sub.id)}
+                                            className={`group p-3 rounded-lg border transition-all cursor-pointer ${
+                                                selectedSubtitleId === sub.id 
+                                                    ? 'bg-blue-500/20 border-blue-500/50 ring-1 ring-blue-500/30' 
+                                                    : currentSubtitle?.id === sub.id 
+                                                        ? 'bg-blue-500/10 border-blue-500/30' 
+                                                        : 'bg-[#1e1e1e] border-transparent hover:bg-[#2a2a2a]'
+                                            }`}
+                                        >
                                             <div className="flex justify-between items-center mb-2 gap-2">
                                                 <div className="flex items-center gap-1.5 flex-1">
                                                     <div className="flex flex-col gap-1 w-20">
@@ -589,7 +1053,15 @@ export default function Editor({ track, onBack }: EditorProps) {
                                                             type="number"
                                                             step="0.1"
                                                             value={sub.endTime || sub.time + 5}
+                                                            onFocus={() => handleTimeFocus(index, 'endTime')}
                                                             onChange={(e) => handleTimeChange(index, 'endTime', e.target.value)}
+                                                            onBlur={() => handleTimeCommit(index, 'endTime')}
+                                                            onKeyDown={(e) => {
+                                                                if (e.key === 'Enter') {
+                                                                    handleTimeCommit(index, 'endTime');
+                                                                    e.currentTarget.blur();
+                                                                }
+                                                            }}
                                                             className="bg-black/20 text-[10px] font-mono text-zinc-300 px-1.5 py-0.5 rounded border border-transparent focus:border-blue-500/50 focus:outline-none w-full"
                                                         />
                                                     </div>

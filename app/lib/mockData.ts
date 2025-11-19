@@ -87,4 +87,22 @@ export const SUBTITLE_STYLES: SubtitleStyle[] = [
     },
 ];
 
-export const DEMO_TRACKS: Track[] = [];
+import demoDataRaw from './demoData.json';
+
+// Type assertion for imported JSON
+const demoData = demoDataRaw as {
+    title: string;
+    videoUrl: string;
+    subtitles: Subtitle[];
+};
+
+export const DEMO_TRACKS: Track[] = [
+    {
+        id: 'sugar-demo',
+        title: demoData.title,
+        artist: 'Maroon 5',
+        coverUrl: 'https://upload.wikimedia.org/wikipedia/en/a/a0/Maroon_5_V.png',
+        videoUrl: demoData.videoUrl,
+        subtitles: demoData.subtitles,
+    },
+];

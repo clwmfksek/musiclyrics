@@ -134,7 +134,42 @@ export default function Hero({ onSelectTrack, onUpload }: HeroProps) {
                 </button>
             </div>
 
-
+            {/* Demo Section */}
+            {DEMO_TRACKS.length > 0 && (
+                <div className="mt-16 w-full max-w-3xl animate-fade-in-up [animation-delay:400ms]">
+                    <div className="text-center mb-6">
+                        <h3 className="text-sm font-semibold text-gray-400 dark:text-gray-500 uppercase tracking-wider mb-4">
+                            Or Try Demo
+                        </h3>
+                    </div>
+                    <div className="grid grid-cols-1 gap-4">
+                        {DEMO_TRACKS.map((track) => (
+                            <button
+                                key={track.id}
+                                onClick={() => onSelectTrack(track)}
+                                className="group relative flex items-center gap-6 p-6 rounded-2xl border border-gray-200 dark:border-white/10 bg-white/50 dark:bg-white/5 hover:bg-gray-50 dark:hover:bg-white/10 hover:shadow-xl transition-all duration-300 hover:scale-[1.02] active:scale-[0.98]"
+                            >
+                                <img
+                                    src={track.coverUrl}
+                                    alt={track.title}
+                                    className="w-20 h-20 rounded-xl object-cover shadow-lg"
+                                />
+                                <div className="flex-1 text-left">
+                                    <h4 className="text-lg font-bold text-gray-900 dark:text-white mb-1">
+                                        {track.title}
+                                    </h4>
+                                    <p className="text-sm text-gray-500 dark:text-gray-400">
+                                        {track.artist}
+                                    </p>
+                                </div>
+                                <div className="flex items-center justify-center w-12 h-12 rounded-full bg-blue-600 text-white group-hover:bg-blue-500 transition-colors">
+                                    <Play size={20} fill="currentColor" className="ml-0.5" />
+                                </div>
+                            </button>
+                        ))}
+                    </div>
+                </div>
+            )}
         </div>
     );
 }

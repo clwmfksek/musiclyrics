@@ -39,7 +39,8 @@ export async function POST(request: Request) {
         // 2. Smart Alignment & Segmentation (GPT-4)
         console.log('Aligning words and creating subtitles...');
         const completion = await openai.chat.completions.create({
-            model: "gpt-4-turbo-preview",
+            model: "gpt-4o",
+            max_tokens: 16000,
             messages: [
                 {
                     role: "system",
@@ -52,15 +53,16 @@ export async function POST(request: Request) {
                      Your Task:
                      1. **Alignment**: Match the "Official Lyrics" to the "Raw Words" based on phonetic similarity.
                      2. **Grouping (Segmentation)**:
-                        - Group the aligned words into short, readable subtitles.
-                        - **MAXIMUM 3-5 words per subtitle**.
-                        - **MAXIMUM 20 characters per line** (unless a single long word).
+                        - Create ONE subtitle for EACH LINE in the Official Lyrics.
+                        - Each line from the lyrics should become a separate subtitle.
+                        - DO NOT combine multiple lines into one subtitle.
                         - Break lines frequently to create a dynamic "music video" feel.
                      3. **Timing**:
-                        - **Start Time**: Must be the 'start' of the FIRST word in the group.
-                        - **End Time**: Must be the 'end' of the LAST word in the group.
+                        - **Start Time**: Must be the 'start' of the FIRST word in that line.
+                        - **End Time**: Must be the 'end' of the LAST word in that line.
                         - This ensures PERFECT synchronization.
                      4. **Translation**: Translate the English text to **Korean**.
+                     5. **IMPORTANT**: Process ALL lines from the Official Lyrics. Do not stop early.
 
                      Output JSON Format:
                      {
@@ -82,7 +84,24 @@ export async function POST(request: Request) {
             response_format: { type: "json_object" }
         });
 
-        const result = JSON.parse(completion.choices[0].message.content || '{}');
+        const completionContent = completion.choices[0].message?.content?.trim();
+
+        if (!completionContent) {
+            console.error('Empty response from alignment model');
+            return NextResponse.json({ error: 'Failed to align subtitles (empty response)' }, { status: 502 });
+        }
+
+        let result;
+        try {
+            result = JSON.parse(completionContent);
+        } catch (parseError) {
+            console.error('Failed to parse alignment JSON:', parseError);
+            console.error('Model response preview (truncated):', completionContent.slice(0, 2000));
+            return NextResponse.json({
+                error: 'Failed to align subtitles (invalid JSON response)',
+                preview: completionContent.slice(0, 500)
+            }, { status: 502 });
+        }
 
         // Add IDs to subtitles
         const subtitles = result.subtitles?.map((sub: any, index: number) => ({
